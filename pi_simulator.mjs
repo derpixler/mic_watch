@@ -1,9 +1,9 @@
 /**
- * pi_simulator.mjs
+ * pi_server.mjs
  *
- * Simulates the Raspberry Pi HTTP server that mic_watch.swift talks to.
- * Serves an ON AIR display page via SSE for real-time updates (e.g. on
- * an Echo Show running the Silk browser).
+ * HTTP server for the On Air lamp. Receives mic state from mic_watch.swift,
+ * controls a USB lamp via shell commands, and serves an SSE-powered
+ * web display as secondary indicator.
  *
  * Routes:
  *   GET /        – ON AIR display (HTML)
@@ -12,11 +12,12 @@
  *   GET /status  – JSON status
  *   GET /events  – SSE stream of lamp state changes
  *
- * Usage:  node pi_simulator.mjs
+ * Usage:  node pi_server.mjs
  */
 
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
+import { exec } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // .env loader
@@ -47,8 +48,16 @@ function loadEnv() {
 }
 
 const dotenv = loadEnv();
-const HOST = process.env.PI_HOST ?? dotenv.PI_HOST ?? "localhost";
-const PORT = parseInt(process.env.PI_PORT ?? dotenv.PI_PORT ?? "8080", 10);
+
+/** Resolves config: process env → .env → fallback. */
+function cfg(key, fallback = "") {
+  return process.env[key] ?? dotenv[key] ?? fallback;
+}
+
+const HOST         = cfg("PI_HOST", "localhost");
+const PORT         = parseInt(cfg("PI_PORT", "8080"), 10);
+const LAMP_CMD_ON  = cfg("LAMP_CMD_ON");
+const LAMP_CMD_OFF = cfg("LAMP_CMD_OFF");
 
 // ---------------------------------------------------------------------------
 // State & SSE
@@ -58,6 +67,21 @@ let lampOn = false;
 
 /** Connected SSE clients (Set of `http.ServerResponse`). */
 const sseClients = new Set();
+
+/**
+ * Executes a shell command to control the physical USB lamp.
+ * Skipped silently when no command is configured (simulator mode).
+ */
+function execLampCmd(cmd, label) {
+  if (!cmd) return;
+  exec(cmd, (err, stdout, stderr) => {
+    if (err) {
+      console.log(`[${timestamp()}]  ⚠️  Lamp ${label} command failed: ${err.message}`);
+      return;
+    }
+    console.log(`[${timestamp()}]  💡  Lamp ${label} command executed`);
+  });
+}
 
 /** Sends a lamp-state event to every connected SSE client. */
 function broadcastState() {
@@ -186,6 +210,7 @@ const server = createServer((req, res) => {
   if (path === "/on") {
     lampOn = true;
     console.log(`[${timestamp()}]  🔴  Lamp ON   ← ${req.method} ${req.url}`);
+    execLampCmd(LAMP_CMD_ON, "ON");
     broadcastState();
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("ON\n");
@@ -196,6 +221,7 @@ const server = createServer((req, res) => {
   if (path === "/off") {
     lampOn = false;
     console.log(`[${timestamp()}]  ⚪  Lamp OFF  ← ${req.method} ${req.url}`);
+    execLampCmd(LAMP_CMD_OFF, "OFF");
     broadcastState();
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("OFF\n");
@@ -216,6 +242,11 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[${timestamp()}]  🚀  Pi simulator listening on http://${HOST}:${PORT}`);
+  console.log(`[${timestamp()}]  🚀  Pi server listening on http://${HOST}:${PORT}`);
   console.log(`[${timestamp()}]  Routes: /  /on  /off  /status  /events`);
+  if (LAMP_CMD_ON) {
+    console.log(`[${timestamp()}]  💡  Lamp commands configured (ON: "${LAMP_CMD_ON}")`);
+  } else {
+    console.log(`[${timestamp()}]  ℹ️   No LAMP_CMD_ON set – running in simulator mode`);
+  }
 });

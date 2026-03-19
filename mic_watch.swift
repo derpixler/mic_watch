@@ -69,6 +69,21 @@ let pollInterval = TimeInterval(config("POLL_INTERVAL", fallback: "0.5", env: do
 let onURL  = URL(string: "\(piBaseURL)/on")!
 let offURL = URL(string: "\(piBaseURL)/off")!
 
+/// Directory for day-based session CSVs. Default: ~/Library/Application Support/mic_watch/sessions
+let sessionLogDir: String = {
+    let custom = config("SESSION_DIR", fallback: "", env: dotenv)
+    if !custom.isEmpty { return (custom as NSString).expandingTildeInPath }
+    return (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/mic_watch/sessions")
+}()
+
+/// Returns the CSV path for the given date (YYYY-MM-DD.csv).
+func sessionLogPath(for date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    let name = formatter.string(from: date) + ".csv"
+    return (sessionLogDir as NSString).appendingPathComponent(name)
+}
+
 // MARK: - State
 
 /// Tracks the last known microphone state to avoid redundant HTTP calls.
@@ -78,14 +93,115 @@ var lastMicActive: Bool? = nil
 /// Running poll counter for log output.
 var pollCount: UInt64 = 0
 
+/// Timestamp when the current microphone session started. `nil` when inactive.
+var sessionStart: Date? = nil
+
 // MARK: - Logging
 
 /// Prints a timestamped, human-readable log line.
+/// Flushes stdout explicitly because LaunchAgent redirects it to a file
+/// which causes block buffering – without fflush output never appears.
 func log(_ message: String) {
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
     let timestamp = formatter.string(from: Date())
     print("[\(timestamp)] \(message)")
+    fflush(stdout)
+}
+
+// MARK: - Session Log (CSV)
+
+/// ISO 8601 formatter shared across all session log writes.
+let isoFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f
+}()
+
+/// Ensures the session directory exists and the CSV for the given date has a header.
+func ensureSessionLogHeader(path: String) {
+    let fm = FileManager.default
+    let dir = (path as NSString).deletingLastPathComponent
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
+    if !fm.fileExists(atPath: path) ||
+       (try? String(contentsOfFile: path, encoding: .utf8))?.isEmpty == true {
+        try? "start,end,duration_min\n".write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
+/// Appends a completed session row to the day-based CSV.
+func writeSession(start: Date, end: Date) {
+    let seconds  = end.timeIntervalSince(start)
+    let minutes  = (seconds / 60.0 * 10).rounded() / 10  // one decimal
+    let path     = sessionLogPath(for: end)
+    let line     = "\(isoFormatter.string(from: start)),\(isoFormatter.string(from: end)),\(minutes)\n"
+
+    guard let data = line.data(using: .utf8) else { return }
+
+    ensureSessionLogHeader(path: path)
+
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile()
+        fh.write(data)
+        fh.closeFile()
+    } else {
+        try? line.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    log("📝  Session recorded: \(isoFormatter.string(from: start)) → \(isoFormatter.string(from: end))  (\(minutes) min)")
+}
+
+/// Closes the current session (if any) and writes it to the CSV.
+/// Clears `sessionStart` before writing so a signal handler that interrupts
+/// between the two operations does not write the same session a second time.
+func closeOpenSession() {
+    guard let start = sessionStart else { return }
+    sessionStart = nil
+    writeSession(start: start, end: Date())
+}
+
+// MARK: - Signal Handling
+
+/// Closes an open session and exits cleanly on SIGTERM / SIGINT.
+func installSignalHandlers() {
+    let handler: @convention(c) (Int32) -> Void = { sig in
+        log("🛑  Received signal \(sig) – shutting down")
+        closeOpenSession()
+        removePidLock()
+        exit(0)
+    }
+    signal(SIGTERM, handler)
+    signal(SIGINT,  handler)
+}
+
+// MARK: - PID Lock
+
+let pidFilePath = "/tmp/micwatch.pid"
+
+/// Ensures only one instance of mic_watch runs at a time.
+/// Writes the current PID to a lock file and kills any stale process
+/// that may still be holding it.
+func acquirePidLock() {
+    let fm = FileManager.default
+    let myPid = ProcessInfo.processInfo.processIdentifier
+
+    if fm.fileExists(atPath: pidFilePath),
+       let content = try? String(contentsOfFile: pidFilePath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       let existingPid = Int32(content) {
+
+        if kill(existingPid, 0) == 0 {
+            log("⚠️  Killing stale instance (PID \(existingPid))")
+            kill(existingPid, SIGTERM)
+            usleep(500_000)
+        }
+    }
+
+    try? "\(myPid)\n".write(toFile: pidFilePath, atomically: true, encoding: .utf8)
+}
+
+/// Removes the PID file on exit.
+func removePidLock() {
+    try? FileManager.default.removeItem(atPath: pidFilePath)
 }
 
 // MARK: - Audio Helpers
@@ -173,8 +289,12 @@ func notifyPi(url: URL) {
 
 // MARK: - Main Loop
 
-log("🎙  mic_watch started – polling every \(pollInterval)s")
+acquirePidLock()
+installSignalHandlers()
+
+log("🎙  mic_watch started (PID \(ProcessInfo.processInfo.processIdentifier)) – polling every \(pollInterval)s")
 log("📡  Pi endpoint: \(piBaseURL)")
+log("📝  Session log dir: \(sessionLogDir)")
 
 /// `RunLoop` is required so `URLSession` callbacks are dispatched correctly
 /// when running as a standalone script.
@@ -182,24 +302,30 @@ let runLoop = RunLoop.current
 let timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { _ in
 
     guard let deviceID = defaultInputDeviceID() else {
-        // Cannot determine device – reset state so the next successful poll
-        // triggers a notification regardless of direction.
+        // Cannot determine device – close any open session and reset state
+        // so the next successful poll triggers a notification.
+        closeOpenSession()
         lastMicActive = nil
         return
     }
 
     guard let active = isDeviceRunning(deviceID) else {
+        closeOpenSession()
         lastMicActive = nil
         return
     }
 
     pollCount += 1
-    let stateLabel = active ? "ON 🔴" : "OFF ⚪"
-    log("📊  Poll #\(pollCount)  mic: \(stateLabel)  device: \(deviceID)")
 
     if active != lastMicActive {
         let endpoint = active ? onURL : offURL
         let label    = active ? "ON 🔴" : "OFF ⚪"
+
+        if active {
+            sessionStart = Date()
+        } else {
+            closeOpenSession()
+        }
 
         log("🎤  Microphone state changed → \(label)  –  notifying \(endpoint)")
         notifyPi(url: endpoint)
