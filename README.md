@@ -1,133 +1,65 @@
 # mic_watch
 
-Überwacht das macOS-Mikrofon und steuert eine USB-Lampe auf einem Raspberry Pi per HTTP –
-als "On Air"-Anzeige vor der Bürotür.
+Überwacht das macOS-Mikrofon und schaltet eine **Shelly AZ Plug** (oder kompatibles Relay) per HTTP –
+als „On Air“-Anzeige (z. B. Lampe an der Steckdose).
 
 ## Architektur
 
 ```
-┌─────────────────┐          HTTP           ┌──────────────────┐
-│  Mac             │  ── /on  ──────────▶   │  Raspberry Pi    │
-│  mic_watch.swift │  ── /off ──────────▶   │  pi_server.mjs   │
-│  (Polling 500ms) │                        │  ↕ uhubctl       │
-└─────────────────┘                         │  ↕ USB-Lampe 💡  │
-                                            └──────────────────┘
+┌─────────────────┐          HTTP GET           ┌──────────────────┐
+│  Mac             │  relay/0?turn=on/off  ───▶  │  Shelly AZ Plug  │
+│  mic_watch.swift │                             │  (WLAN)          │
+│  (Polling)       │                             └──────────────────┘
+└─────────────────┘
 ```
 
 ## Voraussetzungen
 
-**Mac (Sender):**
 - macOS 12+
-- Swift (vorinstalliert mit Xcode / Command Line Tools)
-
-**Raspberry Pi (Empfänger):**
-- Raspberry Pi OS (Bookworm / Bullseye)
-- Node.js 18+
-- uhubctl
-- USB-LED-Lampe (ohne Schalter, leuchtet sofort bei Strom)
+- Swift (Xcode oder Command Line Tools)
+- Shelly AZ Plug im gleichen WLAN wie der Mac (2,4 GHz), lokale HTTP-API aktiv
 
 ## Schnellstart
 
-### 1. Raspberry Pi einrichten
+1. Shelly per App einrichten, **IP-Adresse** notieren (Router oder Shelly-App).
 
-**Option A: SD-Karte am Mac vorbereiten (empfohlen)**
-
-1. [Raspberry Pi Imager](https://www.raspberrypi.com/software/) herunterladen
-2. **Raspberry Pi OS Lite** auf SD-Karte flashen
-   - Im Imager unter "OS anpassen": SSH aktivieren, WLAN konfigurieren, Hostname `onair` setzen
-3. SD-Karte auswerfen, neu einstecken, dann:
-
-```bash
-bash prepare_sd.sh
-```
-
-4. SD-Karte in den Pi, Strom an, ~5 Minuten warten – fertig.
-
-**Option B: Manuell per SSH**
-
-```bash
-git clone <repo-url> ~/mic_watch
-cd ~/mic_watch
-bash pi_setup.sh
-```
-
-Beide Wege installieren Node.js, uhubctl, deployen den Server nach `/opt/mic_watch`
-und erstellen einen systemd-Service der automatisch startet.
-
-### 2. USB-Lampe testen
-
-```bash
-# USB-Hubs und Ports anzeigen
-sudo uhubctl
-
-# Lampe ein
-sudo uhubctl -l 1-1 -a on
-
-# Lampe aus
-sudo uhubctl -l 1-1 -a off
-```
-
-Der `-l` Parameter (Location) hängt vom Pi-Modell ab. Die Ausgabe von `sudo uhubctl`
-zeigt alle verfügbaren Hubs. Bei Bedarf den Wert in `/opt/mic_watch/.env` anpassen.
-
-### 3. Mac konfigurieren
-
-IP des Raspberry Pi ermitteln (z.B. `hostname -I` auf dem Pi), dann in `.env` eintragen:
+2. Konfiguration:
 
 ```bash
 cp .env.example .env
 ```
 
+`.env` anpassen:
+
 ```
-PI_HOST=192.168.1.42
-PI_PORT=8080
+SHELLY_IP=192.168.1.100
 POLL_INTERVAL=0.5
 ```
 
-### 4. Watcher starten
+3. Manuell testen:
+
+```bash
+curl "http://192.168.1.100/relay/0?turn=on"
+curl "http://192.168.1.100/relay/0?turn=off"
+```
+
+4. Watcher starten:
 
 ```bash
 swift mic_watch.swift
 ```
 
-Sobald ein Programm das Mikrofon nutzt (Zoom, Teams, FaceTime, ...), geht die Lampe am Pi an.
+Sobald ein Programm das Mikrofon nutzt (Zoom, Teams, FaceTime, …), schaltet die Shelly ein.
 
-## Konfiguration
+## Konfiguration (.env)
 
-### Mac (.env)
+| Variable         | Beschreibung                                      | Default |
+|------------------|---------------------------------------------------|---------|
+| `SHELLY_IP`      | IP-Adresse des Shelly im LAN (**Pflicht**)        | –       |
+| `POLL_INTERVAL`  | Abfrageintervall in Sekunden                      | `0.5`   |
+| `SESSION_DIR`    | Verzeichnis für tagesbasierte Session-CSVs        | siehe unten |
 
-| Variable        | Beschreibung                          | Default      |
-|-----------------|---------------------------------------|--------------|
-| `PI_HOST`       | Hostname oder IP des Raspberry Pi     | `localhost`          |
-| `PI_PORT`       | HTTP-Port des Pi-Servers              | `8080`               |
-| `POLL_INTERVAL` | Polling-Intervall in Sekunden         | `0.5`                |
-| `SESSION_DIR`   | Verzeichnis für tagesbasierte Session-CSVs | `~/Library/Application Support/mic_watch/sessions` |
-
-### Raspberry Pi (/opt/mic_watch/.env)
-
-| Variable        | Beschreibung                           | Default                          |
-|-----------------|----------------------------------------|----------------------------------|
-| `PI_HOST`       | Bind-Adresse des Servers               | `0.0.0.0`                        |
-| `PI_PORT`       | HTTP-Port                              | `8080`                           |
-| `LAMP_CMD_ON`   | Shell-Befehl: Lampe ein               | `sudo uhubctl -l 1-1 -a on`     |
-| `LAMP_CMD_OFF`  | Shell-Befehl: Lampe aus               | `sudo uhubctl -l 1-1 -a off`    |
-
-Ohne `LAMP_CMD_ON`/`LAMP_CMD_OFF` läuft der Server im Simulator-Modus (keine Hardware).
-
-## Lokales Testen (ohne Pi)
-
-Beide Skripte auf dem Mac starten – der Server läuft im Simulator-Modus:
-
-```bash
-# Terminal 1 – Server (Simulator)
-node pi_simulator.mjs
-
-# Terminal 2 – Watcher
-swift mic_watch.swift
-
-# Browser – ON AIR Display
-open http://localhost:5001/
-```
+Ohne `SHELLY_IP` beendet sich der Watcher mit einer Fehlermeldung.
 
 ## Session-Log (Telefonat-Protokoll)
 
@@ -139,75 +71,15 @@ Jede Mikrofon-Nutzung wird tagesbasiert in CSV-Dateien aufgezeichnet:
 ```csv
 start,end,duration_min
 2026-03-19T11:30:04Z,2026-03-19T11:45:12Z,15.1
-2026-03-19T14:02:00Z,2026-03-19T14:18:33Z,16.6
 ```
 
-Spalten: **Start** (ISO 8601), **Ende**, **Dauer in Minuten**.
-
-```bash
-# Heutige Sessions
-cat ~/Library/Application\ Support/mic_watch/sessions/$(date +%Y-%m-%d).csv
-
-# Gesamtdauer heute (benötigt awk)
-awk -F, 'NR>1{s+=$3}END{printf "%.1f min\n",s}' ~/Library/Application\ Support/mic_watch/sessions/$(date +%Y-%m-%d).csv
-
-# Alle Sessions eines Tages
-ls ~/Library/Application\ Support/mic_watch/sessions/
-```
-
-Der Pfad ist per `SESSION_DIR` in `.env` konfigurierbar. Wird der Prozess per Signal
-beendet (SIGTERM/SIGINT), wird eine laufende Session sauber geschlossen.
-
-## ON AIR Web-Display
-
-Der Server liefert unter `http://<PI_HOST>:<PI_PORT>/` eine Fullscreen-Webseite:
-
-- **Mikrofon aktiv** – roter Hintergrund, grosser "ON AIR"-Schriftzug
-- **Mikrofon inaktiv** – schwarzer Bildschirm
-
-Updates kommen per Server-Sent Events (SSE) in Echtzeit.
-
-## Tests
-
-```bash
-# Unit-Tests (Server-Routen)
-node --test test_simulator.mjs
-
-# Integrationstest (startet Server automatisch)
-bash test_integration.sh
-```
+Der Pfad ist per `SESSION_DIR` in `.env` konfigurierbar. Beenden mit SIGTERM/SIGINT schließt eine laufende Session sauber.
 
 ## Projektstruktur
 
 ```
-mic_watch.swift        # Mac: Mikrofon-Watcher (CoreAudio + HTTP)
-sessions/YYYY-MM-DD.csv  # Mac: Tagesbasierte Session-Logs (in SESSION_DIR)
-pi_simulator.mjs       # Server: HTTP + SSE + Lampensteuerung
-pi_setup.sh            # Pi: Manuelles Setup-Skript (per SSH)
-pi_firstboot.sh        # Pi: Automatisches Setup beim ersten Boot
-prepare_sd.sh          # Mac: SD-Karte für den Pi vorbereiten
-test_simulator.mjs     # Unit-Tests für den Server
-test_integration.sh    # Smoke-/Integrationstest
-.env                   # Lokale Konfiguration (nicht committen)
-.env.example           # Konfigurationsvorlage
-```
-
-## Pi-Verwaltung
-
-```bash
-# Service-Status
-sudo systemctl status mic-watch
-
-# Logs (live)
-sudo journalctl -u mic-watch -f
-
-# Neustart nach Config-Änderung
-sudo systemctl restart mic-watch
-
-# Lampe manuell testen
-curl http://localhost:8080/on
-curl http://localhost:8080/off
-curl http://localhost:8080/status
+mic_watch.swift        # Mac: Mikrofon-Watcher (CoreAudio + HTTP → Shelly)
+.env / .env.example    # Konfiguration
 ```
 
 ## Mac Autostart (LaunchAgent)
@@ -240,29 +112,49 @@ Datei `~/Library/LaunchAgents/de.micwatch.plist` anlegen:
 ```
 
 ```bash
-# Aktivieren
 launchctl load ~/Library/LaunchAgents/de.micwatch.plist
+```
 
-# Deaktivieren
+**Neustart nach Änderungen:** Ein laufender Job lädt `.env` und `mic_watch.swift` nicht automatisch neu. Nach Anpassungen an der plist, am Skript oder an `.env` den Dienst neu starten:
+
+```bash
+# Variante A: entladen und wieder laden
 launchctl unload ~/Library/LaunchAgents/de.micwatch.plist
+launchctl load ~/Library/LaunchAgents/de.micwatch.plist
+```
 
-# Logs
+```bash
+# Variante B: Job beenden und neu starten (bei KeepAlive)
+launchctl kickstart -k gui/$(id -u)/de.micwatch
+```
+
+Deaktivieren:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/de.micwatch.plist
+```
+
+Logs live (stdout + stderr, wie in der plist oben):
+
+```bash
+tail -f /tmp/micwatch.log /tmp/micwatch.err
+```
+
+Nur Standardausgabe:
+
+```bash
 tail -f /tmp/micwatch.log
 ```
 
 ## Hardware
 
-### Empfohlene USB-Lampe
+### Shelly AZ Plug
 
-Eine einfache USB-LED ohne Schalter und ohne Akku, die sofort leuchtet wenn Strom anliegt:
+WLAN-Steckdose mit lokaler HTTP-API:
 
-- **USB LED Mini Stick rot** (~3-5 EUR, Amazon/eBay)
-- Alternativ: USB-Notebooklampe (flexibel, biegbar)
+- Einschalten: `GET http://<IP>/relay/0?turn=on`
+- Ausschalten: `GET http://<IP>/relay/0?turn=off`
 
-Wichtig: Kein eingebauter Schalter, kein Akku, kein Sensor – nur "Strom an = Licht an".
+Lampe oder „On Air“-Leuchte an die Steckdose – kein Raspberry Pi nötig.
 
-### Hinweis zu uhubctl
-
-Beim Raspberry Pi 4 werden alle USB-Ports gleichzeitig geschaltet (ganged power switching).
-Wenn andere USB-Geräte angeschlossen sind, einen USB-Hub mit Per-Port-Switching verwenden.
-Kompatible Hubs: https://github.com/mvp/uhubctl#compatible-usb-hubs
+- [Amazon (Beispiel)](https://www.amazon.de/dp/B0CQPCX7RN) · Shelly Shop

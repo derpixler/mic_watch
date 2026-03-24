@@ -2,9 +2,9 @@
 /**
  * mic_watch.swift
  *
- * Monitors the default audio input device (microphone) on macOS and notifies
- * a Raspberry Pi via HTTP when the microphone becomes active or inactive.
- * Designed to drive an "On Air" indicator lamp over the local network.
+ * Monitors the default audio input device (microphone) on macOS and toggles
+ * a Shelly AZ Plug (or compatible relay) via local HTTP when the microphone
+ * becomes active or inactive — "On Air" indicator over the local network.
  *
  * Usage:  swift mic_watch.swift
  *         chmod +x mic_watch.swift && ./mic_watch.swift
@@ -57,17 +57,11 @@ func config(_ key: String, fallback: String, env: [String: String]) -> String {
 
 let dotenv = loadEnv()
 
-/// Raspberry Pi host and port, assembled into base URL.
-let piHost = config("PI_HOST", fallback: "localhost", env: dotenv)
-let piPort = config("PI_PORT", fallback: "8080", env: dotenv)
-let piBaseURL = "http://\(piHost):\(piPort)"
+/// Shelly device IP (local HTTP API, relay 0).
+let shellyIp = config("SHELLY_IP", fallback: "", env: dotenv).trimmingCharacters(in: .whitespacesAndNewlines)
 
 /// Polling interval in seconds.
 let pollInterval = TimeInterval(config("POLL_INTERVAL", fallback: "0.5", env: dotenv)) ?? 0.5
-
-/// Derived endpoint URLs – lamp on / lamp off.
-let onURL  = URL(string: "\(piBaseURL)/on")!
-let offURL = URL(string: "\(piBaseURL)/off")!
 
 /// Directory for day-based session CSVs. Default: ~/Library/Application Support/mic_watch/sessions
 let sessionLogDir: String = {
@@ -274,7 +268,7 @@ let session = URLSession.shared
 
 /// Sends a fire-and-forget GET request to the given URL.
 /// Errors are logged but never propagated.
-func notifyPi(url: URL) {
+func notifyShelly(url: URL) {
     let task = session.dataTask(with: url) { _, response, error in
         if let error = error {
             log("⚠️  HTTP request to \(url) failed: \(error.localizedDescription)")
@@ -289,11 +283,18 @@ func notifyPi(url: URL) {
 
 // MARK: - Main Loop
 
+guard !shellyIp.isEmpty else {
+    print("[mic_watch] ❌  SHELLY_IP is not set. Add it to .env next to this script (e.g. SHELLY_IP=192.168.1.100).")
+    exit(1)
+}
+let onURL = URL(string: "http://\(shellyIp)/relay/0?turn=on")!
+let offURL = URL(string: "http://\(shellyIp)/relay/0?turn=off")!
+
 acquirePidLock()
 installSignalHandlers()
 
 log("🎙  mic_watch started (PID \(ProcessInfo.processInfo.processIdentifier)) – polling every \(pollInterval)s")
-log("📡  Pi endpoint: \(piBaseURL)")
+log("📡  Shelly: http://\(shellyIp)/relay/0")
 log("📝  Session log dir: \(sessionLogDir)")
 
 /// `RunLoop` is required so `URLSession` callbacks are dispatched correctly
@@ -328,7 +329,7 @@ let timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) 
         }
 
         log("🎤  Microphone state changed → \(label)  –  notifying \(endpoint)")
-        notifyPi(url: endpoint)
+        notifyShelly(url: endpoint)
 
         lastMicActive = active
     }
